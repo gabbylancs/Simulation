@@ -1,0 +1,87 @@
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+
+struct TubeReprojectionError {
+    TubeReprojectionError(double observed_u, double observed_v, double radius, 
+                          double fx, double fy, double cx, double cy)
+        : u_(observed_u), v_(observed_v), R_(radius), 
+          fx_(fx), fy_(fy), cx_(cx), cy_(cy) {}
+
+    template <typename T>
+    bool operator()(const T* const camera_pose, // 6 params: [rot_vec(3), trans(3)]
+                    const T* const point_2d,    // 2 params: [theta, z]
+                    T* residuals) const {
+        
+        // 1. Map theta/z to 3D World Point
+        T X_w[3];
+        X_w[0] = T(R_) * ceres::cos(point_2d[0]);
+        X_w[1] = T(R_) * ceres::sin(point_2d[0]);
+        X_w[2] = point_2d[1];
+
+        // 2. Transform World Point to Camera Frame: X_c = R' * (X_w - c)
+        // camera_pose[0,1,2] is rotation vector, [3,4,5] is camera position c
+        T p[3];
+        p[0] = X_w[0] - camera_pose[3];
+        p[1] = X_w[1] - camera_pose[4];
+        p[2] = X_w[2] - camera_pose[5];
+
+        T X_c[3];
+        // AngleAxisRotatePoint uses the inverse rotation if we pass the negative vector
+        // or we just define the pose as World-to-Camera for simplicity.
+        T inv_rot[3] = {-camera_pose[0], -camera_pose[1], -camera_pose[2]};
+        ceres::AngleAxisRotatePoint(inv_rot, p, X_c);
+
+        // 3. Project to Image Plane (Pinhole Model)
+        T predicted_u = T(fx_) * (X_c[0] / X_c[2]) + T(cx_);
+        T predicted_v = T(fy_) * (X_c[1] / X_c[2]) + T(cy_);
+
+        // 4. Calculate Residuals
+        residuals[0] = predicted_u - T(u_);
+        residuals[1] = predicted_v - T(v_);
+
+        return true;
+    }
+
+    double u_, v_, R_, fx_, fy_, cx_, cy_;
+};
+
+struct DistanceConstraint {
+    DistanceConstraint(double d, double weight) : d_(d), w_(weight) {}
+
+    template <typename T>
+    bool operator()(const T* const cam_i, const T* const cam_j, T* residual) const {
+        // Distance between camera positions (indices 3,4,5 of the pose block)
+        T dx = cam_j[3] - cam_i[3];
+        T dy = cam_j[4] - cam_i[4];
+        T dz = cam_j[5] - cam_i[5];
+        T dist = ceres::sqrt(dx*dx + dy*dy + dz*dz);
+        
+        residual[0] = T(w_) * (dist - T(d_));
+        return true;
+    }
+    double d_, w_;
+};
+
+ceres::Problem problem;
+
+// For each observation (camera i sees point j)
+ceres::CostFunction* cost_function =
+    new ceres::AutoDiffCostFunction<TubeReprojectionError, 2, 6, 2>(
+        new TubeReprojectionError(u, v, R, fx, fy, cx, cy));
+
+problem.AddResidualBlock(cost_function, nullptr, camera_poses[i].data(), points_2d[j].data());
+
+// Add the distance constraint between frames
+problem.AddResidualBlock(
+    new ceres::AutoDiffCostFunction<DistanceConstraint, 1, 6, 6>(
+        new DistanceConstraint(d, 10.0)), nullptr, camera_poses[i].data(), camera_poses[i+1].data());
+
+// Set Solver Options
+ceres::Solver::Options options;
+options.linear_solver_type = ceres::SPARSE_SCHUR; // IMPORTANT for BA speed
+options.minimizer_progress_to_stdout = true;
+
+ceres::Solver::Summary summary;
+ceres::Solve(options, &problem, &summary);
+
+
