@@ -133,10 +133,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="3DMapping.cpp" />
     <ClCompile Include="BACam.cpp" />
+    <ClCompile Include="KeyFeatureMatch.cpp" />
     <ClCompile Include="MiniBundleAdjustment.cpp" />
     <ClCompile Include="PipeBA.cpp" />
     <ClCompile Include="PracticeExample1.cpp" />
+    <ClCompile Include="sim_flower2.cpp" />
+    <ClCompile Include="something.cpp" />
     <ClCompile Include="Source.cpp" />
     <ClCompile Include="Source1.cpp" />
   </ItemGroup>

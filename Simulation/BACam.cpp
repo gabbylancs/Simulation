@@ -27,6 +27,7 @@
 //    // Model: Pixel = Point_Pos / Camera_Pos (Simplified projection)
 //    int operator()(const InputType& params, ValueType& fvec) const
 //    {
+//        fvec.resize(values());
 //        double delta = 1.0; // Huber-like threshold for robust loss
 //
 //        // params[0, 1, 2] is the camera X Y Z
@@ -68,7 +69,8 @@
 //};
 //
 //
-//int main() {
+//int main()
+//{
 //    // 1. Two 2D observations (Point1 at [0,0], Point2 at [100, 50])
 //    Eigen::VectorXd obs(4);
 //    obs << 0.0, 0.0, 100.0, 50.0;

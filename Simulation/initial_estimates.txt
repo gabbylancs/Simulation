@@ -1,0 +1,8 @@
+--- CAMERA INITIAL GUESSES ---
+xc_mm: 0
+yc_mm: 0
+delta_z_mm: 86.3476
+
+--- FEATURE INITIAL GUESSES (theta, z) ---
+count: 468
+index, theta_rad, z_mm

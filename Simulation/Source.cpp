@@ -1,207 +1,386 @@
-#include <opencv2/opencv.hpp>
+#include <Eigen/Dense>           // 1. MUST BE FIRST
+#include <opencv2/opencv.hpp>    // 2. STANDARD OPENCV
+#include <opencv2/core/eigen.hpp>// 3. THE BRIDGE
 #include <iostream>
-#include <string>
-#include <iomanip> // for std::setw
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <cmath>
+#include <fstream> // Add this at the top with other includes
 
-int main() {
-    cv::Mat flowerMap = cv::imread("flower_pipe.jpg");
-    if (flowerMap.empty()) return -1;
+int main()
+{
+    //const double pipeRadius = 67.42/2; //mm
+    const double pipeRadius = 150;
+    //const double fx = 2608.721575, fy = 2584.771277, cx = 1493.821507, cy = 1191.874317;
+    const double fx = 600.0, fy = 600.0, cx = 320.0, cy = 240.0;
 
-    // Constants
-    double pipeRadius = 150.0;
-    double pipeLength = 2000.0;
-    double fx = 600.0, fy = 600.0, cx = 320.0, cy = 240.0;
+    //cv::Mat img1 = cv::imread("flower_pipe_sims_1/pipe_frame_0001.jpg");
+    //cv::Mat img2 = cv::imread("flower_pipe_sims_1/pipe_frame_0007.jpg");
 
-    // Animation Settings
-    int totalFrames = 50;
-    double startZ = 500.0; // Starting distance
-    double endZ = 100.0;   // Ending distance (moving deeper into the pipe)
+    cv::Mat img1 = cv::imread("pipe_frame_0090.jpg");
+    cv::Mat img2 = cv::imread("pipe_frame_0095.jpg");
 
-    for (int frame = 0; frame < totalFrames; frame++) {
-        // Calculate current Z position for this frame
-        double currentZOffset = startZ - ((startZ - endZ) * (double)frame / totalFrames);
 
-        cv::Mat cameraView = cv::Mat::zeros(480, 640, CV_8UC3);
+    //cv::Mat img1 = cv::imread("images/frame1.jpg");
+    //cv::Mat img2 = cv::imread("images/frame2.jpg");
 
-        // --- Core Projection Loop ---
-        for (int v = 0; v < cameraView.rows; v++) {
-            for (int u = 0; u < cameraView.cols; u++) {
-                double normX = (u - cx) / fx;
-                double normY = (v - cy) / fy;
 
-                double t = pipeRadius / std::sqrt(normX * normX + normY * normY);
-                double Z = t * 1.0;
+    if (img1.empty() || img2.empty()) return -1;
 
-                double theta = std::atan2(t * normY, t * normX);
-                if (theta < 0) theta += 2.0 * CV_PI;
+    // --- 1. PREPROCESSING ---
+    auto preprocess = [](cv::Mat& img) {
+        cv::Mat gray;
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
 
-                // Use the moving currentZOffset here
-                double z_in_pipe = Z - currentZOffset;
+        // CLAHE to handle lighting in dark pipes
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+        clahe->apply(gray, gray);
 
-                int srcX = static_cast<int>((theta / (2.0 * CV_PI)) * flowerMap.cols);
-                int srcY = static_cast<int>((z_in_pipe / pipeLength) * flowerMap.rows);
+        // Slight Blur to reduce sensor noise
+        cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0);
+        return gray;
+        };
 
-                if (srcX >= 0 && srcX < flowerMap.cols && srcY >= 0 && srcY < flowerMap.rows) {
-                    cameraView.at<cv::Vec3b>(v, u) = flowerMap.at<cv::Vec3b>(srcY, srcX);
-                }
+    cv::Mat gray1 = preprocess(img1);
+    cv::Mat gray2 = preprocess(img2);
+
+    // --- 2. FEATURE DETECTION ---
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(2000); // Increased for better RANSAC pool
+    std::vector<cv::KeyPoint> kp1, kp2;
+    cv::Mat desc1, desc2;
+    orb->detectAndCompute(gray1, cv::noArray(), kp1, desc1);
+    orb->detectAndCompute(gray2, cv::noArray(), kp2, desc2);
+
+    // --- 3. MATCHING ---
+    cv::BFMatcher matcher(cv::NORM_HAMMING);
+    std::vector<cv::DMatch> matches;
+    matcher.match(desc1, desc2, matches);
+
+    // --- 4. RANSAC FILTERING ---
+    std::vector<cv::Point2f> pts1, pts2;
+    for (const auto& m : matches) {
+        pts1.push_back(kp1[m.queryIdx].pt);
+        pts2.push_back(kp2[m.trainIdx].pt);
+    }
+
+    // Find Fundamental Matrix with RANSAC to identify inliers
+    std::vector<uchar> inliersMask;
+    cv::findFundamentalMat(pts1, pts2, cv::FM_RANSAC, 3.0, 0.99, inliersMask);
+
+    std::vector<cv::DMatch> ransacMatches;
+    for (size_t i = 0; i < inliersMask.size(); i++) {
+        if (inliersMask[i]) {
+            ransacMatches.push_back(matches[i]);
+        }
+    }
+
+    cv::Mat inliersMask2;
+    cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+    cv::Mat E = cv::findEssentialMat(pts1, pts2, K, cv::RANSAC, 0.999, 1.0, inliersMask2);
+    cv::Mat R, t;
+    cv::recoverPose(E, pts1, pts2, K, R, t, inliersMask2);
+
+    // --- NEW: ESTIMATE DISTANCE MOVED USING PIPE GEOMETRY ---
+    double estimatedDistance = 0.0;
+    std::vector<cv::Point3f> pointCloud;
+
+	int featureCount = 0;
+    if (!t.empty() && !ransacMatches.empty()) 
+    {
+        // 1. Back-project rays from Frame 1 onto the cylinder wall
+        // A point on the cylinder (centered at 0,0) satisfies X^2 + Y^2 = R^2
+        std::vector<cv::Point2f> inliers1, inliers2;
+        std::vector<cv::Point3f> pts3D_frame1;
+
+        for (size_t i = 0; i < inliersMask2.rows; i++) {
+            if (inliersMask2.at<uchar>(i)) 
+            {
+				featureCount++;
+                cv::Point2f p = pts1[i];
+                // ray direction
+                double rx = (p.x - cx) / fx;
+                double ry = (p.y - cy) / fy;
+                double rz = 1.0;
+
+                // Intersection of ray s*[rx, ry, rz] with X^2 + Y^2 = R^2
+                // s^2 * (rx^2 + ry^2) = R^2
+                double s = pipeRadius / std::sqrt(rx * rx + ry * ry);
+                pts3D_frame1.push_back(cv::Point3f(s * rx, s * ry, s * rz));
+
+                inliers1.push_back(pts1[i]);
+                inliers2.push_back(pts2[i]);
             }
         }
 
-        // --- Apply Effects (Noise/Vignette/Flashlight) ---
-        // (Insert your previous noise and vignette code here)
+        // 2. Triangulate with unit t to find the relative scale
+        cv::Mat P1 = K * cv::Mat::eye(3, 4, CV_64F);
+        cv::Mat Rt2_unit;
+        cv::hconcat(R, t, Rt2_unit);
+        cv::Mat P2 = K * Rt2_unit;
 
-        // --- Save Frame ---
-        std::stringstream ss;
-        ss << "frame_" << std::setfill('0') << std::setw(3) << frame << ".jpg";
-        cv::imwrite(ss.str(), cameraView);
+        cv::Mat pts4D;
+        cv::triangulatePoints(P1, P2, inliers1, inliers2, pts4D);
 
-        std::cout << "Saved: " << ss.str() << " (Z: " << currentZOffset << ")" << std::endl;
+        // 3. Compare Triangulated Depth vs Cylindrical Depth to find scale
+        double scaleSum = 0;
+        int count = 0;
+        for (int i = 0; i < pts4D.cols; i++) {
+            float w = pts4D.at<float>(3, i);
+            cv::Point3f p_tri(pts4D.at<float>(0, i) / w, pts4D.at<float>(1, i) / w, pts4D.at<float>(2, i) / w);
 
-        // Optional: Show progress
-        cv::imshow("Simulating...", cameraView);
-        if (cv::waitKey(1) == 27) break; // Exit on ESC
+            if (p_tri.z > 0) {
+                // Scale = Real Depth / Unit Depth
+                double real_z = pts3D_frame1[i].z;
+                scaleSum += (real_z / p_tri.z);
+                count++;
+            }
+        }
+
+        if (count > 0) {
+            double finalScale = scaleSum / count;
+            cv::Mat t_metric = t * finalScale;
+            estimatedDistance = cv::norm(t_metric); // Distance in mm
+
+            // Populate point cloud for mapping
+            for (auto& p : pts3D_frame1) pointCloud.push_back(p);
+        }
     }
+
+    // --- RECORD INITIAL ESTIMATES TO FILE ---
+    std::ofstream outFile("initial_estimates.txt");
+    if (outFile.is_open()) {
+        outFile << "--- CAMERA INITIAL GUESSES ---\n";
+        outFile << "xc_mm: " << 0 << "\n";
+        outFile << "yc_mm: " << 0 << "\n";
+        outFile << "delta_z_mm: " << estimatedDistance << "\n\n";
+
+        outFile << "--- FEATURE INITIAL GUESSES (theta, z) ---\n";
+        outFile << "count: " << featureCount << "\n";
+        outFile << "index, theta_rad, z_mm\n";
+
+        /*for (size_t i = 0; i < featureCount; ++i) 
+        {
+            outFile << i << ", "
+                << initialFeatures[i].theta << ", "
+                << initialFeatures[i].z << "\n";
+        }*/
+        outFile.close();
+        std::cout << "Initial estimates successfully saved to initial_estimates.txt" << std::endl;
+    }
+    else 
+    {
+        std::cerr << "Error: Could not open file for writing." << std::endl;
+    }
+
+    // --- 5. VISUALIZATION ---
+    cv::Mat imgMatches;
+    cv::hconcat(img1, img2, imgMatches);
+
+    for (const auto& m : ransacMatches)
+    {
+        cv::Point2f pt1 = kp1[m.queryIdx].pt;
+        cv::Point2f pt2 = kp2[m.trainIdx].pt;
+        cv::Point2f pt2_shifted = pt2 + cv::Point2f((float)img1.cols, 0.0f);
+
+        cv::line(imgMatches, pt1, pt2_shifted, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    }
+
+    // --- NEW: DRAW EPIPOLE ---
+    if (!t.empty()) {
+        double tx = t.at<double>(0), ty = t.at<double>(1), tz = t.at<double>(2);
+        if (std::abs(tz) > 0.01) { // Forward motion check
+            cv::Point2f epipole(static_cast<float>((fx * tx / tz) + cx),
+                static_cast<float>((fy * ty / tz) + cy));
+
+            cv::Point2f epShifted = epipole + cv::Point2f((float)img1.cols, 0);
+            cv::drawMarker(imgMatches, epShifted, cv::Scalar(0, 0, 255), cv::MARKER_CROSS, 40, 3);
+        }
+    }
+
+
+    // Resize the final combined image for display (e.g., 50% scale)
+    cv::Mat displayImg;
+    double scale = 0.8;
+    cv::resize(imgMatches, displayImg, cv::Size(), scale, scale, cv::INTER_LINEAR);
+
+    cv::imshow("RANSAC Inlier Matches (Resized for Display)", displayImg);
+    cv::waitKey(0);
 
     return 0;
 }
-
-//#include <opencv2/opencv.hpp>
-//#include <iostream>
-//#include <cmath>
+// 
+// 
 //
-//void addSaltAndPepper(cv::Mat& image, float noise_fraction)
-//{
-//    int amount = static_cast<int>(image.rows * image.cols * noise_fraction);
-//    for (int i = 0; i < amount; i++)
+//struct Point3D {
+//    Eigen::Vector3d pos;
+//    int id;
+//};
+//
+//struct GlobalLandmark {
+//    Eigen::Vector3d pos;
+//    int observations = 0;
+//};
+//
+//// --- GLOBAL MAP WITH LANDMARK PERSISTENCE ---
+//struct GlobalMap {
+//    std::map<int, GlobalLandmark> landmarks;
+//    Eigen::Matrix3d R_world = Eigen::Matrix3d::Identity();
+//    Eigen::Vector3d t_world = Eigen::Vector3d::Zero();
+//
+//    void addFusedPoints(const std::vector<Point3D>& local_points,
+//        const cv::Mat& R_curr, const cv::Mat& t_curr,
+//        double motor_dist_mm, double alpha)
 //    {
-//        int r = rand() % image.rows;
-//        int c = rand() % image.cols;
-//        // Randomly choose between white (255) and black (0)
-//        image.at<cv::Vec3b>(r, c) = (rand() % 2 == 0) ? cv::Vec3b(255, 255, 255) : cv::Vec3b(0, 0, 0);
-//    }
-//}
+//        Eigen::Matrix3d R_step;
+//        Eigen::Vector3d t_direction;
+//        cv::cv2eigen(R_curr, R_step);
+//        cv::cv2eigen(t_curr, t_direction);
 //
-//int main() {
-//    // 1. Load the unwrapped pipe image
-//    // Assume: Width = 0 to 360 degrees, Height = 0 to Max Depth
-//    cv::Mat flowerMap = cv::imread("flower_pipe.jpg");
-//    if (flowerMap.empty()) {
-//        std::pair<int, int> error; // Just a placeholder for your error handling
-//        std::cout << "Could not open or find the image 'flower_pipe.jpg'" << std::endl;
-//        return -1;
-//    }
+//        // Ensure forward motion
+//        if (t_direction.z() < 0) t_direction = -t_direction;
 //
-//    // 2. Physical & Camera Parameters
-//    double pipeRadius = 150.0;    // mm
-//    double pipeLength = 2000.0;   // mm
-//    double zOffset = 200.0;       // Distance from camera to start of pipe
+//        // Apply Scale Fusion
+//        double fused_scale = motor_dist_mm; // Can be expanded to trust VO more
 //
-//    // Camera Intrinsic Matrix K
-//    double fx = 600.0, fy = 600.0;
-//    double cx = 320.0, cy = 240.0;
+//        // Update Global Pose
+//        t_world += R_world * (t_direction * fused_scale);
+//        R_world = R_world * R_step;
 //
-//    // 3. Create Output Image
-//    cv::Mat cameraView = cv::Mat::zeros(480, 640, CV_8UC3);
+//        // INTEGRATION: This makes features "stick" by using their IDs
+//        for (const auto& lp : local_points) {
+//            Eigen::Vector3d p_global = R_world * lp.pos + t_world;
 //
-//    // 4. Backward Mapping (Loop over output pixels)
-//    for (int v = 0; v < cameraView.rows; v++) {
-//        for (int u = 0; u < cameraView.cols; u++) {
-//
-//            // Step A: Convert pixel (u,v) to normalized camera coordinates (x, y, 1)
-//            double normX = (u - cx) / fx;
-//            double normY = (v - cy) / fy;
-//
-//            /* Step B: Intersection with Cylinder.
-//               A ray from origin (0,0,0) through (normX, normY, 1) is:
-//               P = t * [normX, normY, 1]
-//               Cylinder equation: P.x^2 + P.y^2 = R^2
-//               (t*normX)^2 + (t*normY)^2 = R^2
-//            */
-//            double t = pipeRadius / std::sqrt(normX * normX + normY * normY);
-//
-//            // 3D Point on cylinder wall
-//            double X = t * normX;
-//            double Y = t * normY;
-//            double Z = t * 1.0; // depth
-//
-//            // Step C: Map 3D back to Unwrapped Image Coordinates
-//            // 1. Get Angle (theta)
-//            double theta = std::atan2(Y, X); // -PI to PI
-//            if (theta < 0) theta += 2.0 * CV_PI; // 0 to 2*PI
-//
-//            // 2. Get Depth (z)
-//            double z_in_pipe = Z - zOffset;
-//
-//            // Step D: Convert Theta/Z to Source Pixel indices
-//            int srcX = static_cast<int>((theta / (2.0 * CV_PI)) * flowerMap.cols);
-//            int srcY = static_cast<int>((z_in_pipe / pipeLength) * flowerMap.rows);
-//
-//            // Step E: Boundary Check and Sample
-//            if (srcX >= 0 && srcX < flowerMap.cols && srcY >= 0 && srcY < flowerMap.rows) {
-//                cameraView.at<cv::Vec3b>(v, u) = flowerMap.at<cv::Vec3b>(srcY, srcX);
+//            if (landmarks.find(lp.id) != landmarks.end()) {
+//                // Feature already exists: Average position to kill jitter/drift
+//                auto& gp = landmarks[lp.id];
+//                gp.pos = (gp.pos * gp.observations + p_global) / (gp.observations + 1);
+//                gp.observations++;
+//            }
+//            else {
+//                // New Landmark: Anchor it
+//                landmarks[lp.id] = { p_global, 1 };
 //            }
 //        }
+//        std::cout << "Robot Z: " << t_world.z() << " mm | Map Points: " << landmarks.size() << std::endl;
 //    }
-//    
-//    // --- ADDING NOISE SECTION ---
+//};
 //
-//    // 1. Add Gaussian Noise
-//    cv::Mat gaussianNoise = cv::Mat::zeros(cameraView.size(), cameraView.type());
-//    // Mean 0, StdDev 15 (subtle grain)
-//    cv::randn(gaussianNoise, cv::Scalar(0, 0, 0), cv::Scalar(15, 15, 15));
-//    cameraView += gaussianNoise;
+//// --- RECONSTRUCTION WITH OFFSET ---
+//std::vector<Point3D> reconstructPipePoints(const std::vector<cv::Point2f>& pts1, const std::vector<int>& ids,
+//    double pipe_radius, Eigen::Vector2d offset, double fx, double fy, double cx, double cy)
+//{
+//    std::vector<Point3D> reconstructed_points;
+//    double ox = offset.x();
+//    double oy = offset.y();
 //
-//    // 2. Add Salt & Pepper (optional)
-//    // 0.01 = 1% of pixels are noise
-//    int sp_count = static_cast<int>(cameraView.rows * cameraView.cols * 0.005);
-//    for (int k = 0; k < sp_count; k++) {
-//        int i = rand() % cameraView.rows;
-//        int j = rand() % cameraView.cols;
-//        cameraView.at<cv::Vec3b>(i, j) = (rand() % 2 == 0) ? cv::Vec3b(255, 255, 255) : cv::Vec3b(0, 0, 0);
+//    for (size_t i = 0; i < pts1.size(); ++i) {
+//        double dx = (pts1[i].x - cx) / fx;
+//        double dy = (pts1[i].y - cy) / fy;
+//        Eigen::Vector3d ray(dx, dy, 1.0);
+//        ray.normalize(); // Normalize for quadratic solver
+//
+//        // Quadratic: (s*rx - ox)^2 + (s*ry - oy)^2 = R^2
+//        double A = ray.x() * ray.x() + ray.y() * ray.y();
+//        double B = -2.0 * (ray.x() * ox + ray.y() * oy);
+//        double C = (ox * ox + oy * oy) - (pipe_radius * pipe_radius);
+//
+//        double discriminant = B * B - 4 * A * C;
+//        if (discriminant < 0) continue;
+//
+//        double s = (-B + std::sqrt(discriminant)) / (2.0 * A);
+//        reconstructed_points.push_back({ s * ray, ids[i] });
+//    }
+//    return reconstructed_points;
+//}
+//
+//void visualizeGlobalMap(const GlobalMap& map, double pipeRadius, Eigen::Vector2d offset)
+//{
+//    cv::Mat canvas = cv::Mat::zeros(400, 1200, CV_8UC3);
+//    double scale = 0.4;
+//    int offsetX = 100, offsetY = 200;
+//
+//    // Draw Walls
+//    int wallLimit = (int)(pipeRadius * scale);
+//    cv::line(canvas, { 0, offsetY - wallLimit }, { 1200, offsetY - wallLimit }, { 0,0,100 }, 2);
+//    cv::line(canvas, { 0, offsetY + wallLimit }, { 1200, offsetY + wallLimit }, { 0,0,100 }, 2);
+//
+//    // Draw Landmarks (Green)
+//    for (const auto& pair : map.landmarks) {
+//        const auto& p = pair.second.pos;
+//        int iz = (int)(p.z() * scale) + offsetX;
+//        int ix = (int)(p.x() * scale) + offsetY;
+//        if (iz >= 0 && iz < canvas.cols && ix >= 0 && ix < canvas.rows)
+//            cv::circle(canvas, { iz, ix }, 1, { 0, 255, 0 }, -1);
 //    }
 //
-//    // 3. Final Step: Slight Blur
-//    // Real cameras aren't perfectly sharp; a tiny blur makes the noise look more realistic
-//    cv::GaussianBlur(cameraView, cameraView, cv::Size(3, 3), 0.5);
+//    // Draw Robot (Orange/Blue) - Account for offset in view
+//    int camZ = (int)(map.t_world.z() * scale) + offsetX;
+//    int camX = (int)((map.t_world.x() + offset.x()) * scale) + offsetY;
 //
-//    // --- 3. APPLY LED LIGHT FALL-OFF (Flashlight Effect) ---
-//    // We'll create a new lighting mask based on Depth (Z)
-//    cv::Mat lightMask = cv::Mat::zeros(cameraView.size(), CV_32F);
+//    if (camZ >= 0 && camZ < canvas.cols) {
+//        cv::circle(canvas, { camZ, camX }, 10, { 255, 150, 0 }, -1);
+//        cv::putText(canvas, "ROBOT", { camZ + 15, camX }, 0, 0.5, { 255, 255, 255 }, 1);
+//    }
 //
-//    // We need to re-run a simplified loop or save Z values to apply lighting correctly
-//    for (int v = 0; v < cameraView.rows; v++) {
-//        for (int u = 0; u < cameraView.cols; u++) {
-//            double normX = (u - cx) / fx;
-//            double normY = (v - cy) / fy;
+//    cv::imshow("Z-X Global Map", canvas);
+//    cv::waitKey(1);
+//}
 //
-//            // Re-calculate Z for this pixel
-//            double t = pipeRadius / std::sqrt(normX * normX + normY * normY);
-//            double Z = t * 1.0;
+//int main()
+//{
+//    const double pipeRadius = 150.0;
+//    const double fx = 600.0, fy = 600.0, cx = 320.0, cy = 240.0;
+//    Eigen::Vector2d cameraOffset(0.0, 0.0); // Robot can be moved off center
 //
-//            // Light fall-off formula: 1 / (Z^2) is realistic, 
-//            // but we'll use a tunable linear/exp fall-off for the "look"
-//            double attenuation = 500.0 / (Z + 100.0); // Adjust '500' to change brightness
-//            if (attenuation > 1.0) attenuation = 1.0;
-//            if (attenuation < 0.1) attenuation = 0.1; // Ambient light
+//    GlobalMap pipeMap;
+//    cv::Ptr<cv::ORB> orb = cv::ORB::create(1000);
+//    cv::BFMatcher matcher(cv::NORM_HAMMING);
 //
-//            lightMask.at<float>(v, u) = static_cast<float>(attenuation);
+//    for (int f = 0; f < 90; f += 10) {
+//        std::string p1 = "flower_pipe_sims/pipe_frame_" + std::to_string(f).insert(0, 4 - std::to_string(f).length(), '0') + ".jpg";
+//        std::string p2 = "flower_pipe_sims/pipe_frame_" + std::to_string(f + 10).insert(0, 4 - std::to_string(f + 10).length(), '0') + ".jpg";
+//
+//        cv::Mat img1 = cv::imread(p1, 0), img2 = cv::imread(p2, 0);
+//        if (img1.empty() || img2.empty()) break;
+//
+//        std::vector<cv::KeyPoint> kp1, kp2;
+//        cv::Mat desc1, desc2;
+//        orb->detectAndCompute(img1, cv::noArray(), kp1, desc1);
+//        orb->detectAndCompute(img2, cv::noArray(), kp2, desc2);
+//
+//        std::vector<cv::DMatch> matches;
+//        matcher.match(desc1, desc2, matches);
+//        std::sort(matches.begin(), matches.end());
+//        if (matches.size() > 150) matches.erase(matches.begin() + 150, matches.end());
+//
+//        std::vector<cv::Point2f> pts1, pts2;
+//        std::vector<int> ids;
+//        for (const auto& m : matches) {
+//            pts1.push_back(kp1[m.queryIdx].pt);
+//            pts2.push_back(kp2[m.trainIdx].pt);
+//            ids.push_back(m.queryIdx); // Keep original ID for stickiness
 //        }
-//    }
 //
-//    // Apply the light mask to the image
-//    cv::Mat cameraViewFloat;
-//    cameraView.convertTo(cameraViewFloat, CV_32FC3);
-//    std::vector<cv::Mat> channels;
-//    cv::split(cameraViewFloat, channels);
-//    for (int i = 0; i < 3; i++) {
-//        channels[i] = channels[i].mul(lightMask);
-//    }
-//    cv::merge(channels, cameraViewFloat);
-//    cameraViewFloat.convertTo(cameraView, CV_8UC3);
+//        cv::Mat mask, R, t;
+//        cv::Mat E = cv::findEssentialMat(pts1, pts2, fx, { cx, cy }, cv::RANSAC, 0.999, 1.0, mask);
+//        cv::recoverPose(E, pts1, pts2, R, t, fx, { cx, cy }, mask);
 //
-//    // --- 4. SHOW RESULTS ---
-//    cv::imshow("Realistic Pipe View", cameraView);
+//        std::vector<cv::Point2f> inliers1;
+//        std::vector<int> inlierIds;
+//        for (int i = 0; i < mask.rows; i++) {
+//            if (mask.at<uchar>(i)) {
+//                inliers1.push_back(pts1[i]);
+//                inlierIds.push_back(ids[i]);
+//            }
+//        }
+//
+//        auto localPoints = reconstructPipePoints(inliers1, inlierIds, pipeRadius, cameraOffset, fx, fy, cx, cy);
+//        pipeMap.addFusedPoints(localPoints, R, t, 150.0, 0.6);
+//
+//        visualizeGlobalMap(pipeMap, pipeRadius, cameraOffset);
+//        if (cv::waitKey(30) == 27) break;
+//    }
 //    cv::waitKey(0);
-//
 //    return 0;
-}
+//}
